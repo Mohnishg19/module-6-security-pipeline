@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+serving/model/package/
+test-results.xml
+trivy-report.json
+.pytest_cache/

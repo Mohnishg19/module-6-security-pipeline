@@ -1,0 +1,106 @@
+name: security-pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: "0 6 * * 1"   # WHY: a scan result goes stale as new CVEs are disclosed; a weekly rerun on an
+                          # unchanged main branch is how you learn yesterday's approved image is today's problem.
+
+permissions:
+  contents: read
+
+jobs:
+  # ---- Gate 1: unit tests for the API contract ----
+  tests:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: serving } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r requirements.txt pytest
+      - run: python -m pytest tests/ -q --junitxml=../test-results.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: test-results, path: test-results.xml }
+
+  # ---- Gate 2: SAST (ruff + bandit) ----
+  sast:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: serving } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install ruff "bandit[toml]"
+      - run: ruff check .                       # config (incl. the scoped S101 ignore) is in pyproject.toml
+      - run: bandit -r app model -c pyproject.toml -q   # -c so bandit reads the reasoned B311 skip
+
+  # ---- Gate 3: secret scan (backstop regex) ----
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash pipeline/scripts/secret_backstop.sh .
+
+  # ---- Gate 4: dependency review + exact-pin check ----
+  deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: exact-pin check
+        run: python3 pipeline/scripts/check_pins.py serving/requirements.txt
+      - name: dependency review (PRs only)
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@v4
+
+  # ---- Gate 5: build the image and scan it ----
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build the model package into the build context
+        run: |
+          pip install -r serving/requirements.txt
+          (cd serving && python -m model.package_model)
+      - name: build image
+        run: docker build -t auth-anomaly-api:ci serving
+      - name: scan image — full report (never gates, always uploaded)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: auth-anomaly-api:ci
+          format: json
+          output: trivy-report.json
+          exit-code: "0"
+          ignore-unfixed: true      # POLICY DECISION, not a default — see README. Keep the full report below.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: image-evidence, path: trivy-report.json }
+      - name: scan image — enforce the threshold
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: auth-anomaly-api:ci
+          format: table
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+  # ---- The aggregate check branch protection points at ----
+  security-gates:
+    # WHY THIS EXISTS: protecting the branch by listing five job names means a renamed job silently stops being
+    # required and nobody notices. One aggregate check is harder to get wrong. Point branch protection at THIS.
+    runs-on: ubuntu-latest
+    needs: [ tests, sast, secrets, deps, image ]
+    if: always()
+    steps:
+      - name: fail if any gate failed
+        run: |
+          echo "tests=${{ needs.tests.result }} sast=${{ needs.sast.result }} secrets=${{ needs.secrets.result }} deps=${{ needs.deps.result }} image=${{ needs.image.result }}"
+          [ "${{ needs.tests.result }}" = "success" ] \
+            && [ "${{ needs.sast.result }}" = "success" ] \
+            && [ "${{ needs.secrets.result }}" = "success" ] \
+            && [ "${{ needs.deps.result }}" = "success" ] \
+            && [ "${{ needs.image.result }}" = "success" ]
